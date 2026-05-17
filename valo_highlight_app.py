@@ -569,17 +569,61 @@ def assign_kills_to_rounds(kills, boundaries, gap=None):
     return result
 
 
+# ─────────────────────────────────────────────────────────────
+# GPU encoder detection (NVENC)
+# ─────────────────────────────────────────────────────────────
+
+_nvenc_available = None   # None = not yet tested
+
+def _check_nvenc():
+    """Return True if h264_nvenc is available on this machine."""
+    global _nvenc_available
+    if _nvenc_available is not None:
+        return _nvenc_available
+    try:
+        r = subprocess.run(
+            [FFMPEG, "-f", "lavfi", "-i", "nullsrc=s=128x128:d=1",
+             "-t", "1", "-c:v", "h264_nvenc", "-f", "null", "-"],
+            capture_output=True, timeout=10)
+        _nvenc_available = (r.returncode == 0)
+    except Exception:
+        _nvenc_available = False
+    return _nvenc_available
+
+
+def _video_enc_args():
+    """
+    Return the best available video encoder args as a flat list.
+    NVENC (GPU):  h264_nvenc  -preset p4  -rc vbr  -cq 18
+    CPU fallback: libx264     -preset slow -crf 16
+    NVENC is ~10x faster and produces equal or better quality.
+    CQ 18 ≈ CRF 16 visually — both are near-transparent quality.
+    """
+    if _check_nvenc():
+        return ["-c:v", "h264_nvenc",
+                "-preset", "p4",      # p1=fastest … p7=best; p4 = balanced
+                "-rc", "vbr",         # variable bitrate → better quality
+                "-cq", "18",          # quality target (lower = better)
+                "-b:v", "0"]          # let CQ drive bitrate fully
+    else:
+        return ["-c:v", "libx264",
+                "-preset", "slow",    # better compression than 'fast'
+                "-crf", "16"]         # slightly higher quality than old crf 18
+
+
 def cut_clip(video, ss, duration, output):
+    """Cut a single clip — uses GPU (NVENC) if available, else CPU x264."""
     subprocess.run(
         [FFMPEG, "-y",
          "-ss", str(max(0, ss)), "-i", video,
-         "-t", str(duration),
-         "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-         "-c:a", "aac", "-b:a", "192k", output],
+         "-t", str(duration)]
+        + _video_enc_args()
+        + ["-c:a", "aac", "-b:a", "192k", output],
         capture_output=True)
 
 
 def join_clips(clips, output, vertical=False):
+    """Concat clips and optionally reformat to 9:16 vertical."""
     out_dir  = os.path.dirname(output) or "."
     concat_f = os.path.join(out_dir, "_tmp_concat.txt")
     joined   = os.path.join(out_dir, "_tmp_joined.mp4")
@@ -597,10 +641,11 @@ def join_clips(clips, output, vertical=False):
               "[bg]scale=-2:1920,crop=1080:1920,boxblur=20:5[blurred];"
               "[main]scale=1080:607[fg];"
               "[blurred][fg]overlay=0:656")
-        subprocess.run([FFMPEG, "-y", "-i", joined, "-vf", vf,
-                        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-                        "-c:a", "aac", "-b:a", "192k", output],
-                       capture_output=True)
+        subprocess.run(
+            [FFMPEG, "-y", "-i", joined, "-vf", vf]
+            + _video_enc_args()
+            + ["-c:a", "aac", "-b:a", "192k", output],
+            capture_output=True)
         os.remove(joined)
     else:
         os.replace(joined, output)
@@ -645,6 +690,13 @@ class App(ctk.CTk):
         ctk.CTkLabel(tabbar, text="ValoHighlight",
                      font=ctk.CTkFont(size=15, weight="bold"),
                      text_color="#00d4ff").pack(side="left", padx=16)
+
+        # Encoder badge — detected once at startup
+        enc_text  = "⚡ GPU · NVENC" if _check_nvenc() else "🖥 CPU · x264"
+        enc_color = "#00cc66" if _check_nvenc() else "#ffaa00"
+        ctk.CTkLabel(tabbar, text=enc_text,
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=enc_color).pack(side="right", padx=(0, 8))
 
         self.source_lbl = ctk.CTkLabel(tabbar, text="",
                                         font=ctk.CTkFont(size=11),
@@ -1084,6 +1136,9 @@ class App(ctk.CTk):
             return
         self.gen_btn.configure(state="disabled", text="Generating…")
         self.progress.set(0)
+        # Detect encoder before starting (runs once, cached after first call)
+        enc_label = "GPU (NVENC)" if _check_nvenc() else "CPU (x264)"
+        self._set_status(f"Encoder: {enc_label} — starting…")
         threading.Thread(target=self._generate_thread, daemon=True).start()
 
     def _generate_thread(self):
